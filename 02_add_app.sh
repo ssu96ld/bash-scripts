@@ -30,11 +30,35 @@ LIVE_DOMAIN="$(strip_domain "${LIVE_DOMAIN}")"
 export NVM_DIR="$(eval echo ~${APP_USER})/.nvm"; . "$NVM_DIR/nvm.sh" 2>/dev/null || true
 
 # helpers
-find_free_port(){ local p="$1"; while ss -ltn "( sport = :$p )" >/dev/null 2>&1; do p=$((p+1)); done; echo "$p"; }
+# Returns the first free TCP port at or above the starting port.
+find_free_port() {
+  local port="$1"
+  while :; do
+    # If ss prints nothing, port is free
+    if [[ -z "$(ss -H -ltn "sport = :$port")" ]]; then
+      echo "$port"
+      return
+    else
+      port=$((port+1))
+    fi
+  done
+}
+
+
 branch_exists_remote(){ git ls-remote --heads "$1" "$2" | grep -q "refs/heads/$2"; }
 
-DEFAULT_BRANCH="$(git ls-remote --symref "${REPO_URL}" HEAD 2>/dev/null | awk -F/ '/^ref:/ {print $3}')"
-[[ -z "${DEFAULT_BRANCH}" ]] && DEFAULT_BRANCH="main"
+# Determine the repo’s default branch (main/master) robustly
+DEFAULT_BRANCH="$(
+  git ls-remote --symref "${REPO_URL}" HEAD 2>/dev/null \
+  | sed -nE 's#^ref: refs/heads/([[:graph:]]+)[[:space:]]+HEAD$#\1#p' \
+  | head -n1
+)"
+if [[ -z "${DEFAULT_BRANCH}" ]]; then
+  # Fallback: scan for main/master if the symref approach fails
+  DEFAULT_BRANCH="$(git ls-remote "${REPO_URL}" 2>/dev/null | awk -F/ '/refs\/heads\/(main|master)$/ {print $NF; exit}')"
+fi
+: "${DEFAULT_BRANCH:=main}"
+
 
 APP_DIR_ROOT="${WWW_ROOT}/${APP_NAME}"
 LIVE_DIR="${APP_DIR_ROOT}/live"
