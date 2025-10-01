@@ -40,7 +40,6 @@ get_port_for_dir() {
     p="$(grep -E '^PORT=' "$dir/.env" | sed -E 's/^PORT=//; s/"//g' | tail -n1)"
   fi
   if [[ -z "$p" && -f "$dir/ecosystem.config.js" ]]; then
-    # best-effort parse: PORT: "3000" or PORT: 3000
     p="$(grep -Eo 'PORT[^0-9]*[\"\x27]?([0-9]{2,5})[\"\x27]?' "$dir/ecosystem.config.js" | grep -Eo '[0-9]{2,5}' | head -n1 || true)"
   fi
   echo "$p"
@@ -48,11 +47,10 @@ get_port_for_dir() {
 
 # Find domain (server_name) whose server block proxies to a given port
 get_domain_for_port() {
-  local port="$1" conf f dom=""
+  local port="$1" conf dom=""
   shopt -s nullglob
   for conf in "$NGINX_CONF_DIR"/*.conf; do
     grep -qE "proxy_pass\s+http://127\.0\.0\.1:$port" "$conf" || continue
-    # first server_name on or after start of server block
     dom="$(awk '
       /server\s*\{/ {inserver=1}
       inserver && /server_name/ {print $2; exit}
@@ -77,7 +75,6 @@ get_pm2_json() {
   try_users+=("root")
   local u out=""
   for u in "${try_users[@]}"; do
-    # shellcheck disable=SC2027
     out="$(sudo -u "$u" bash -lc 'export NVM_DIR="$HOME/.nvm"; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; pm2 jlist 2>/dev/null || true' || true)"
     [[ -n "$out" && "$out" != "[]" ]] && { echo "$out"; return 0; }
   done
@@ -136,8 +133,10 @@ echo "  public_ip: \"$(yaml_q "$PUBLIC_IP")\""
 
 echo "gitdeploy:"
 if [[ "$GITDEPLOY_EXISTS" == "true" ]]; then
-  info="$(getent passwd "$GIT_USER" | awk -F: '{print $1\":\"$3\":\"$6\":\"$7}')"
-  IFS=: read -r GU_NAME GU_UID GU_HOME GU_SHELL <<<"$info"
+  # Parse passwd line safely without awk quoting woes
+  # passwd fields: name:passwd:uid:gid:gecos:home:shell
+  GU_NAME=""; GU_UID=""; GU_GID=""; GU_GECOS=""; GU_HOME=""; GU_SHELL=""
+  IFS=: read -r GU_NAME _ GU_UID GU_GID GU_GECOS GU_HOME GU_SHELL < <(getent passwd "$GIT_USER")
   echo "  username: \"${GU_NAME}\""
   echo "  uid: \"${GU_UID}\""
   echo "  home: \"$(yaml_q "$GU_HOME")\""
@@ -193,7 +192,7 @@ if [[ -d "$WWW_ROOT" ]]; then
         domain=""
         [[ -n "$port" ]] && domain="$(get_domain_for_port "$port")"
 
-        # PM2 linkage: by cwd (exact match). Fallback to name convention "<app>-<env>"
+        # PM2 linkage: by cwd (exact). Fallback to name "<app>-<env>"
         pm2_name=""; pm2_status=""; pm2_id=""; pm2_cpu=""; pm2_mem=""; pm2_env_port=""
         if [[ -n "$PM2_MAP" ]]; then
           while IFS='|' read -r cwd name status id cpu mem penv_port; do
@@ -204,14 +203,12 @@ if [[ -d "$WWW_ROOT" ]]; then
             fi
           done <<< "$PM2_MAP"
         fi
-        # if still no pm2_name, infer conventional name
         [[ -z "$pm2_name" ]] && pm2_name="${app_name}-${env}"
 
         # Health checks
         https_code=""; http_code=""; local_code=""
         if [[ -n "$domain" ]]; then
           https_code="$(curl_code "https://${domain}/")"
-          # if https fails or is 000/400+, try http as well
           http_code="$(curl_code "http://${domain}/")"
         fi
         if [[ -n "$port" ]]; then
