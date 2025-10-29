@@ -207,16 +207,25 @@ find_free_port() {
 }
 
 branch_exists_remote(){
-  sudo -u gitdeploy bash -lc "git ls-remote --heads '$1' '$2'" | grep -q "refs/heads/$2"
+  sudo -u "${APP_USER}" bash -lc "git ls-remote --heads '$1' '$2'" | grep -q "refs/heads/$2"
 }
 
 
 clone_or_pull () {
   local branch="$1" target_dir="$2"
+
+  # Remove if it exists but is not a Git repo
+  if [[ -d "${target_dir}" && ! -d "${target_dir}/.git" ]]; then
+    echo "Removing non-git directory before cloning: ${target_dir}"
+    rm -rf "${target_dir}"
+  fi
+
   if [[ -d "${target_dir}/.git" ]]; then
-    sudo -u gitdeploy bash -lc "cd '${target_dir}' && git fetch origin '${branch}' && git checkout '${branch}' && git reset --hard 'origin/${branch}'"
+    echo "Updating existing branch in ${target_dir}"
+    sudo -u "${APP_USER}" bash -lc "cd '${target_dir}' && git fetch origin '${branch}' && git checkout '${branch}' && git reset --hard 'origin/${branch}'"
   else
-    sudo -u gitdeploy bash -lc "git clone --branch '${branch}' --single-branch '${REPO_URL}' '${target_dir}'"
+    echo "Cloning branch '${branch}' into ${target_dir}"
+    sudo -u "${APP_USER}" bash -lc "git clone --branch '${branch}' --single-branch '${REPO_URL}' '${target_dir}'"
   fi
 }
 
@@ -256,7 +265,7 @@ clone_or_pull "${BRANCH_NAME}" "${BRANCH_DIR}"
 # --- PM2 ecosystem + .env ---
 make_ecosystem(){
   local dir="$1" name="$2" port="$3"
-  cat > "${dir}/ecosystem.config.js" <<EOF
+  cat > "${dir}/ecosystem.config.cjs" <<EOF
 module.exports = {
   apps: [{
     name: "${name}",
@@ -268,8 +277,9 @@ module.exports = {
   }]
 };
 EOF
-  chown "${APP_USER}:${APP_USER}" "${dir}/ecosystem.config.js"
+  chown "${APP_USER}:${APP_USER}" "${dir}/ecosystem.config.cjs"
 }
+
 make_env(){
   local dir="$1" port="$2"
   [[ -f "${dir}/.env" ]] || { echo -e "PORT=${port}\nNODE_ENV=development" > "${dir}/.env"; chown "${APP_USER}:${APP_USER}" "${dir}/.env"; }
@@ -287,7 +297,7 @@ start_pm2(){
     npm config set fund false >/dev/null 2>&1 || true
     npm config set audit false >/dev/null 2>&1 || true
     CI=1 npm ci --no-audit --no-fund --unsafe-perm || CI=1 npm install --no-audit --no-fund --unsafe-perm
-    pm2 start ecosystem.config.js || pm2 restart ecosystem.config.js
+    pm2 start ecosystem.config.cjs || pm2 restart ecosystem.config.cjs
   '
 }
 start_pm2 "${BRANCH_DIR}"
