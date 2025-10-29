@@ -205,16 +205,21 @@ find_free_port() {
     port=$((port+1))
   done
 }
-branch_exists_remote(){ git ls-remote --heads "$1" "$2" | grep -q "refs/heads/$2"; }
+
+branch_exists_remote(){
+  sudo -u gitdeploy bash -lc "git ls-remote --heads '$1' '$2'" | grep -q "refs/heads/$2"
+}
+
 
 clone_or_pull () {
   local branch="$1" target_dir="$2"
   if [[ -d "${target_dir}/.git" ]]; then
-    sudo -u "${APP_USER}" bash -lc "cd '${target_dir}' && git fetch origin '${branch}' && git checkout '${branch}' && git reset --hard 'origin/${branch}'"
+    sudo -u gitdeploy bash -lc "cd '${target_dir}' && git fetch origin '${branch}' && git checkout '${branch}' && git reset --hard 'origin/${branch}'"
   else
-    sudo -u "${APP_USER}" bash -lc "git clone --branch '${branch}' --single-branch '${REPO_URL}' '${target_dir}'"
+    sudo -u gitdeploy bash -lc "git clone --branch '${branch}' --single-branch '${REPO_URL}' '${target_dir}'"
   fi
 }
+
 
 repo_full_name_from_url () {
   local url="$1" out=""
