@@ -21,8 +21,14 @@ BASE_PORT=3100   # base to scan from for feature branches
 
 if [[ $EUID -ne 0 ]]; then echo "Run as root (sudo)"; exit 1; fi
 
-APP_USER="${SUDO_USER:-root}"
+GIT_USER="gitdeploy"
+APP_USER="${SUDO_USER:-$(id -un)}"
 APP_HOME="$(eval echo ~${APP_USER})"
+
+if ! id -u "$GIT_USER" >/dev/null 2>&1; then
+  echo "ERROR: gitdeploy user not found. Run your server setup first."
+  exit 1
+fi
 
 ensure_nvm_pm2() {
   sudo -u "${APP_USER}" bash -lc '
@@ -33,6 +39,8 @@ ensure_nvm_pm2() {
     command -v pm2 >/dev/null 2>&1 || npm i -g pm2
   '
 }
+
+git_as_deploy() { sudo -u "${GIT_USER}" bash -lc "$*"; }
 
 install_or_upgrade_webhook_server(){
   mkdir -p "${WEBHOOK_DIR}"
@@ -207,7 +215,7 @@ find_free_port() {
 }
 
 branch_exists_remote(){
-  sudo -u "${APP_USER}" bash -lc "git ls-remote --heads '$1' '$2'" | grep -q "refs/heads/$2"
+  git_as_deploy "git ls-remote --heads '$1' '$2'" | grep -q "refs/heads/$2"
 }
 
 
@@ -220,13 +228,18 @@ clone_or_pull () {
     rm -rf "${target_dir}"
   fi
 
+  mkdir -p "${target_dir}"
+  chown -R "${GIT_USER}:${APP_USER}" "${target_dir}"
+
   if [[ -d "${target_dir}/.git" ]]; then
     echo "Updating existing branch in ${target_dir}"
-    sudo -u "${APP_USER}" bash -lc "cd '${target_dir}' && git fetch origin '${branch}' && git checkout '${branch}' && git reset --hard 'origin/${branch}'"
+    git_as_deploy "cd '${target_dir}' && git fetch origin '${branch}' && git checkout '${branch}' && git reset --hard 'origin/${branch}'"
   else
     echo "Cloning branch '${branch}' into ${target_dir}"
-    sudo -u "${APP_USER}" bash -lc "git clone --branch '${branch}' --single-branch '${REPO_URL}' '${target_dir}'"
+    git_as_deploy "git clone --branch '${branch}' --single-branch '${REPO_URL}' '${target_dir}'"
   fi
+
+  chown -R "${APP_USER}:${APP_USER}" "${target_dir}"
 }
 
 

@@ -6,7 +6,7 @@ trap 'echo "❌ ERROR on line $LINENO (exit code $?)" >&2' ERR
 # 02_add_app.sh
 # - Adds/updates a Node app (live/dev/staging)
 # - Git access via gitdeploy user
-# - App ownership and PM2 processes under ubuntu
+# - App ownership and PM2 processes under APP_USER (logged-in sudo user)
 # ===========================================
 
 WWW_ROOT="/var/www"
@@ -17,7 +17,7 @@ BASE_PORT=3000
 
 # Users
 GIT_USER="gitdeploy"
-APP_USER="${SUDO_USER:-ubuntu}"
+APP_USER="${SUDO_USER:-$(id -un)}"
 APP_HOME="$(eval echo ~${APP_USER})"
 GIT_HOME="/home/${GIT_USER}"
 

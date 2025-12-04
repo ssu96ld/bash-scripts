@@ -8,7 +8,7 @@ GIT_USER="gitdeploy"
 SHELL_FOR_USERS="/bin/bash"
 WEBHOOK_DIR="/opt/deploy-webhooks"
 WEBHOOK_PORT=9000
-APP_USER="${SUDO_USER:-root}"
+APP_USER="${SUDO_USER:-$(id -un)}"
 APP_HOME="$(eval echo ~${APP_USER})"
 NVM_VERSION="v0.39.7"
 

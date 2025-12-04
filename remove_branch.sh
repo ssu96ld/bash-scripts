@@ -18,7 +18,7 @@ WEBHOOK_PORT=9000  # not strictly needed here, but left for parity
 
 if [[ $EUID -ne 0 ]]; then echo "Run as root (sudo)"; exit 1; fi
 
-APP_USER="${SUDO_USER:-root}"
+APP_USER="${SUDO_USER:-$(id -un)}"
 APP_HOME="$(eval echo ~${APP_USER})"
 
 ensure_nvm_pm2() {
