@@ -218,11 +218,296 @@ issue_tls "${LIVE_DOMAIN}"
 # ---- Webhook integration ----
 install_or_upgrade_webhook_server() {
   mkdir -p "${WEBHOOK_DIR}"
-  # (webhook server setup unchanged – keep your existing logic here)
+
+  # Create hooks.json if missing
+  if [[ ! -f "${WEBHOOK_DIR}/hooks.json" ]]; then
+    cat > "${WEBHOOK_DIR}/hooks.json" <<JSON
+{
+  "listenHost": "127.0.0.1",
+  "listenPort": ${WEBHOOK_PORT},
+  "hooks": [],
+  "github": []
 }
+JSON
+    chown "${APP_USER}:${APP_USER}" "${WEBHOOK_DIR}/hooks.json"
+  fi
+
+  # Install/upgrade server.js to multi-app version if missing or outdated
+  local needs_upgrade="yes"
+  if [[ -f "${WEBHOOK_DIR}/server.js" ]]; then
+    if grep -q "MULTI_GITHUB_SUPPORT" "${WEBHOOK_DIR}/server.js"; then
+      needs_upgrade="no"
+    fi
+  fi
+
+  if [[ "${needs_upgrade}" == "yes" ]]; then
+    cp -a "${WEBHOOK_DIR}/server.js" "${WEBHOOK_DIR}/server.js.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    cat > "${WEBHOOK_DIR}/server.js" <<'JS'
+// MULTI_GITHUB_SUPPORT
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { exec } = require('child_process');
+
+const cfgPath = path.join(__dirname, 'hooks.json');
+
+function loadCfg() { return JSON.parse(fs.readFileSync(cfgPath, 'utf8')); }
+function respond(res, code, obj) { res.writeHead(code, {'Content-Type':'application/json'}); res.end(JSON.stringify(obj)); }
+
+function timingSafeEq(a, b) {
+  const A = Buffer.from(a || '');
+  const B = Buffer.from(b || '');
+  if (A.length !== B.length) return false;
+  return crypto.timingSafeEqual(A, B);
+}
+function verifyGitHubSig(buf, secret, hdr) {
+  if (!hdr || !hdr.startsWith('sha256=')) return false;
+  const h = crypto.createHmac('sha256', secret); h.update(buf);
+  const expected = 'sha256=' + h.digest('hex');
+  return timingSafeEq(expected, hdr);
+}
+function runDeploy(dir, branch, pm2Name, cb) {
+  const cmds = [
+    `cd '${dir.replace(/'/g, `'\\''`)}'`,
+    `git fetch --all --prune`,
+    `git reset --hard origin/${branch}`,
+    `(npm ci || npm install)`,
+    `pm2 restart '${pm2Name.replace(/'/g, `'\\''`)}'`
+  ].join(' && ');
+  exec(cmds, { shell:'/bin/bash' }, (err, stdout, stderr) => {
+    if (err) return cb(err, stderr.toString());
+    cb(null, stdout.toString());
+  });
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://localhost');
+  const host = (req.headers['host'] || '').split(':')[0];
+  const cfg = loadCfg();
+
+  if (req.method === 'GET' && url.pathname === '/_deploy/health') {
+    return respond(res, 200, { ok:true, pong:true });
+  }
+
+  // simple hooks (per-domain, secret header)
+  const simpleCandidates = (cfg.hooks || []).filter(h => (h.path === url.pathname) && (h.type === 'simple' || !h.type));
+  if (simpleCandidates.length) {
+    if (req.method !== 'POST') return respond(res, 405, { ok:false, error:'method not allowed' });
+    let use = simpleCandidates.find(h => !!h.host && h.host === host) || simpleCandidates[0];
+    const secret = req.headers['x-webhook-secret'];
+    if (!secret || secret !== use.secret) return respond(res, 401, { ok:false, error:'unauthorized' });
+    return runDeploy(use.dir, use.branch, use.pm2, (err, out) => {
+      if (err) return respond(res, 500, { ok:false, error:'deploy failed', details: out });
+      return respond(res, 200, { ok:true, result: out, id: use.id, host });
+    });
+  }
+
+  // GitHub HMAC hooks (shared path; select by repo+ref)
+  const ghCandidates = (cfg.github || []).filter(h => h.path === url.pathname);
+  if (ghCandidates.length) {
+    if (req.method !== 'POST') return respond(res, 405, { ok:false, error:'method not allowed' });
+    const chunks = [];
+    req.on('data', d => chunks.push(d));
+    req.on('end', () => {
+      const buf = Buffer.concat(chunks);
+      const event = req.headers['x-github-event'] || '';
+      if (event === 'ping') return respond(res, 200, { ok:true, pong:true });
+
+      let lastErr = null;
+      for (const gh of ghCandidates) {
+        try {
+          const sig = req.headers['x-hub-signature-256'];
+          if (!verifyGitHubSig(buf, gh.secret, sig)) continue;
+          const payload = JSON.parse(buf.toString('utf8'));
+          const fullName = payload?.repository?.full_name;
+          const ref = payload?.ref;
+          if (gh.repo && fullName !== gh.repo) { lastErr = `repo mismatch ${fullName}`; continue; }
+          const target = gh.map?.[ref];
+          if (!target) { lastErr = `no mapping for ${ref}`; continue; }
+          return runDeploy(target.dir, target.branch, target.pm2, (err, out) => {
+            if (err) return respond(res, 500, { ok:false, error:'deploy failed', details: out, repo: fullName, ref });
+            return respond(res, 200, { ok:true, result: out, repo: fullName, ref, id: gh.id });
+          });
+        } catch (e) { lastErr = e.message; }
+      }
+      return respond(res, 200, { ok:true, ignored: lastErr || 'no candidate matched' });
+    });
+    return;
+  }
+
+  return respond(res, 404, { ok:false, error:'not found' });
+});
+
+const cfg = loadCfg();
+server.listen(cfg.listenPort, cfg.listenHost, () => {
+  console.log(`Webhook server listening on ${cfg.listenHost}:${cfg.listenPort}`);
+});
+JS
+    chown "${APP_USER}:${APP_USER}" "${WEBHOOK_DIR}/server.js"
+  fi
+
+  # Ensure pm2 process is up
+  sudo -u "${APP_USER}" bash -lc '
+    export NVM_DIR=$HOME/.nvm; . "$NVM_DIR/nvm.sh"
+    cd "'"${WEBHOOK_DIR}"'"
+    npm init -y >/dev/null 2>&1 || true
+    pm2 start server.js --name deploy-webhooks || pm2 restart deploy-webhooks
+    pm2 save
+  '
+}
+
 install_or_upgrade_webhook_server
 
-# (hooks.json Python section unchanged)
+# ---- hooks.json entries for live/dev/staging + secrets ----
+python3 - "${WEBHOOK_DIR}/hooks.json" "${APP_NAME}" "${REPO_URL}" "${DEFAULT_BRANCH}" \
+         "${LIVE_DIR}" "${DEV_DIR}" "${STAGING_DIR}" \
+         "${LIVE_DOMAIN}" "${DEV_DOMAIN}" "${STAGING_DOMAIN}" <<'PY'
+import json, os, sys, re, secrets
+
+cfg_path, app_name, repo_url, default_branch, live_dir, dev_dir, staging_dir, live_domain, dev_domain, staging_domain = sys.argv[1:11]
+
+def load():
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def save(cfg):
+    with open(cfg_path, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=2)
+
+def parse_owner_repo(url):
+    m = re.match(r'^git@github\.com:([^/]+)/([^/]+)\.git$', url)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    m = re.match(r'^https?://github\.com/([^/]+)/([^/.]+)(?:\.git)?$', url)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    return ""
+
+def get_or_create_secret():
+    return secrets.token_hex(32)
+
+cfg = load()
+cfg.setdefault("hooks", [])
+cfg.setdefault("github", [])
+
+repo_full = parse_owner_repo(repo_url)
+
+def upsert_simple_hook(hooks, hook_id, path, host, dir_path, branch, pm2_name):
+    if not host:
+        return None
+    entry = None
+    for h in hooks:
+        if h.get("id") == hook_id:
+            h.update({
+                "type": "simple",
+                "path": path,
+                "host": host,
+                "dir": dir_path,
+                "branch": branch,
+                "pm2": pm2_name,
+            })
+            entry = h
+            break
+    if not entry:
+        entry = {
+            "type": "simple",
+            "id": hook_id,
+            "path": path,
+            "host": host,
+            "dir": dir_path,
+            "branch": branch,
+            "pm2": pm2_name,
+            "secret": get_or_create_secret(),
+        }
+        hooks.append(entry)
+    return entry
+
+live_simple = upsert_simple_hook(
+    cfg["hooks"],
+    f"{app_name}-live",
+    "/_deploy/live",
+    live_domain,
+    live_dir,
+    default_branch,
+    f"{app_name}-live",
+)
+
+dev_simple = upsert_simple_hook(
+    cfg["hooks"],
+    f"{app_name}-dev",
+    "/_deploy/dev",
+    dev_domain,
+    dev_dir,
+    "dev",
+    f"{app_name}-dev",
+) if dev_domain else None
+
+staging_simple = upsert_simple_hook(
+    cfg["hooks"],
+    f"{app_name}-staging",
+    "/_deploy/staging",
+    staging_domain,
+    staging_dir,
+    "staging",
+    f"{app_name}-staging",
+) if staging_domain else None
+
+# GitHub HMAC mapping for this repo (one entry per repo, shared path /_github)
+gh = None
+if repo_full:
+    for g in cfg["github"]:
+        if g.get("repo") == repo_full:
+            gh = g
+            break
+    if not gh:
+        gh = {
+            "id": app_name,
+            "path": "/_github",
+            "secret": get_or_create_secret(),
+            "repo": repo_full,
+            "map": {},
+        }
+        cfg["github"].append(gh)
+
+    gh.setdefault("map", {})
+    gh["map"][f"refs/heads/{default_branch}"] = {
+        "dir": live_dir,
+        "pm2": f"{app_name}-live",
+        "branch": default_branch,
+    }
+    if dev_dir and dev_domain:
+        gh["map"]["refs/heads/dev"] = {
+            "dir": dev_dir,
+            "pm2": f"{app_name}-dev",
+            "branch": "dev",
+        }
+    if staging_dir and staging_domain:
+        gh["map"]["refs/heads/staging"] = {
+            "dir": staging_dir,
+            "pm2": f"{app_name}-staging",
+            "branch": "staging",
+        }
+
+save(cfg)
+
+print((live_simple or {}).get("secret", ""))
+print((dev_simple or {}).get("secret", ""))
+print((staging_simple or {}).get("secret", ""))
+print((gh or {}).get("secret", ""))
+PY
+
+read -r LIVE_HOOK_SECRET || LIVE_HOOK_SECRET=""
+read -r DEV_HOOK_SECRET || DEV_HOOK_SECRET=""
+read -r STAGING_HOOK_SECRET || STAGING_HOOK_SECRET=""
+read -r GH_SECRET || GH_SECRET=""
+
+# restart webhook server to pick up changes
+sudo -u "${APP_USER}" bash -lc '
+  export NVM_DIR=$HOME/.nvm; . "$NVM_DIR/nvm.sh"
+  pm2 restart deploy-webhooks || true
+  pm2 save || true
+'
 
 echo
 echo "================== APP ADDED/UPDATED =================="
@@ -231,4 +516,17 @@ echo "Repo: ${REPO_URL} (branch: ${DEFAULT_BRANCH})"
 echo "Live:    https://${LIVE_DOMAIN} (PORT ${LIVE_PORT})"
 [[ -n "${DEV_DOMAIN}" ]] && echo "Dev:     https://${DEV_DOMAIN} (PORT ${DEV_PORT})"
 [[ -n "${STAGING_DOMAIN}" ]] && echo "Staging: https://${STAGING_DOMAIN} (PORT ${STAGING_PORT})"
+echo
+echo "Manual deploy webhooks (POST with X-Webhook-Secret):"
+echo "  https://${LIVE_DOMAIN}/_deploy/live        Secret: ${LIVE_HOOK_SECRET:-existing}"
+[[ -n "${DEV_DOMAIN}" ]] && echo "  https://${DEV_DOMAIN}/_deploy/dev         Secret: ${DEV_HOOK_SECRET:-existing}"
+[[ -n "${STAGING_DOMAIN}" ]] && echo "  https://${STAGING_DOMAIN}/_deploy/staging     Secret: ${STAGING_HOOK_SECRET:-existing}"
+echo
+echo "GitHub webhook (HMAC verified):"
+echo "  Payload URL: https://${LIVE_DOMAIN}/_github"
+echo "  Secret: ${GH_SECRET:-existing}"
+echo "  Mapping:"
+echo "    refs/heads/${DEFAULT_BRANCH}  → ${LIVE_DIR}      (pm2: ${APP_NAME}-live)"
+[[ -n "${DEV_DOMAIN}" ]] && echo "    refs/heads/dev             → ${DEV_DIR}       (pm2: ${APP_NAME}-dev)"
+[[ -n "${STAGING_DOMAIN}" ]] && echo "    refs/heads/staging         → ${STAGING_DIR}   (pm2: ${APP_NAME}-staging)"
 echo "========================================================"

@@ -9,6 +9,8 @@ NGINX_CONF_DIR="/etc/nginx/conf.d"
 GIT_USER="gitdeploy"
 PUBKEY_PATH="/home/${GIT_USER}/.ssh/id_ed25519.pub"
 PRIVKEY_PATH="/home/${GIT_USER}/.ssh/id_ed25519"
+WEBHOOK_DIR="/opt/deploy-webhooks"
+HOOKS_JSON_PATH="${WEBHOOK_DIR}/hooks.json"
 
 # ---------- helpers ----------
 indent() { local n="$1"; shift; local pad; pad="$(printf '%*s' "$n" '')"; sed "s/^/${pad}/"; }
@@ -107,6 +109,30 @@ for p in plist:
 PY
 }
 
+# Build simple webhook lookup: DIR|PATH|SECRET|HOST for type=simple hooks
+build_webhook_map() {
+  local json="$1"
+  command -v python3 >/dev/null 2>&1 || { echo ""; return 0; }
+  python3 - "$json" <<'PY'
+import json, sys
+data = sys.argv[1]
+try:
+    cfg = json.loads(data)
+except Exception:
+    cfg = {}
+for h in (cfg.get("hooks") or []):
+    if h.get("type") not in (None, "simple"):
+        continue
+    d = h.get("dir") or ""
+    path = h.get("path") or ""
+    secret = h.get("secret") or ""
+    host = h.get("host") or ""
+    if not d or not path:
+        continue
+    print(f"{d}|{path}|{secret}|{host}")
+PY
+}
+
 # ---------- gather host ----------
 STAMP="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 HOST_FQDN="$(hostname -f 2>/dev/null || hostname || echo unknown)"
@@ -121,6 +147,12 @@ if id -u "$GIT_USER" >/dev/null 2>&1; then GITDEPLOY_EXISTS="true"; fi
 # PM2 mapping
 PM2_JSON="$(get_pm2_json)"
 PM2_MAP="$(build_pm2_map "$PM2_JSON")"
+
+# Webhook mapping (if present)
+WEBHOOK_MAP=""
+if [[ -f "$HOOKS_JSON_PATH" ]]; then
+  WEBHOOK_MAP="$(build_webhook_map "$(cat "$HOOKS_JSON_PATH")")"
+fi
 
 # ---------- output YAML ----------
 echo "---"
@@ -215,6 +247,18 @@ if [[ -d "$WWW_ROOT" ]]; then
           local_code="$(curl_code "http://127.0.0.1:${port}/")"
         fi
 
+        # Webhook (simple) mapping by env directory
+        hook_path=""; hook_secret=""; hook_host=""
+        if [[ -n "$WEBHOOK_MAP" ]]; then
+          while IFS='|' read -r hdir hpath hsecret hhost; do
+            [[ -z "$hdir" ]] && continue
+            if [[ "$hdir" == "$env_dir" ]]; then
+              hook_path="$hpath"; hook_secret="$hsecret"; hook_host="$hhost"
+              break
+            fi
+          done <<< "$WEBHOOK_MAP"
+        fi
+
         echo "      - env: \"$(yaml_q "$env")\""
         echo "        path: \"$(yaml_q "$env_dir")\""
         echo "        repo: \"$(yaml_q "$repo")\""
@@ -234,6 +278,17 @@ if [[ -d "$WWW_ROOT" ]]; then
         echo "          https_code: \"$(yaml_q "${https_code:-}")\""
         echo "          http_code: \"$(yaml_q "${http_code:-}")\""
         echo "          local_code: \"$(yaml_q "${local_code:-}")\""
+        if [[ -n "$hook_path" ]]; then
+          echo "        deploy:"
+          echo "          webhook_path: \"$(yaml_q "$hook_path")\""
+          echo "          webhook_secret: \"$(yaml_q "$hook_secret")\""
+          if [[ -n "$domain" ]]; then
+            echo "          curl_example: |"
+            echo "            curl -X POST \"https://${domain}${hook_path}\" \\"
+            echo "              -H \"x-webhook-secret: ${hook_secret}\" \\"
+            echo "              -d '{}'"
+          fi
+        fi
       done
     done
   fi
