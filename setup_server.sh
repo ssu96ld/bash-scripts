@@ -12,6 +12,8 @@ APP_USER="${SUDO_USER:-$(id -un)}"
 APP_HOME="$(eval echo ~${APP_USER})"
 NVM_VERSION="v0.39.7"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 if [[ $EUID -ne 0 ]]; then echo "Run as root (sudo)"; exit 1; fi
 
 # --- Packages ---
@@ -58,69 +60,7 @@ sudo -u "$APP_USER" bash -lc "
   fi
 "
 
-# --- Shared webhook server (create once) ---
-if [[ ! -d "$WEBHOOK_DIR" ]]; then
-  mkdir -p "$WEBHOOK_DIR"
-  cat > "$WEBHOOK_DIR/hooks.json" <<JSON
-{
-  "listenHost": "127.0.0.1",
-  "listenPort": ${WEBHOOK_PORT},
-  "hooks": []
-}
-JSON
-
-  cat > "$WEBHOOK_DIR/server.js" <<'JS'
-const http = require('http');
-const { exec } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const cfgPath = path.join(__dirname, 'hooks.json');
-
-function loadCfg() {
-  return JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-}
-function respond(res, code, obj) {
-  res.writeHead(code, {'Content-Type':'application/json'}); res.end(JSON.stringify(obj));
-}
-const server = http.createServer((req, res) => {
-  if (req.method === 'GET' && req.url === '/_deploy/health') return respond(res, 200, {ok:true});
-  const cfg = loadCfg();
-  const url = new URL(req.url, 'http://localhost');
-  const hook = (cfg.hooks || []).find(h => h.path === url.pathname);
-  if (!hook) return respond(res, 404, {ok:false,error:'not found'});
-  if (req.method !== 'POST') return respond(res, 405, {ok:false,error:'method not allowed'});
-  const secret = req.headers['x-webhook-secret'];
-  if (!secret || secret !== hook.secret) return respond(res, 401, {ok:false,error:'unauthorized'});
-
-  const cmds = [
-    `cd '${hook.dir.replace(/'/g, `'\\''`)}'`,
-    `git fetch --all --prune`,
-    `git reset --hard origin/${hook.branch}`,
-    `(npm ci || npm install)`,
-    `pm2 restart '${hook.pm2.replace(/'/g, `'\\''`)}'`
-  ].join(' && ');
-
-  exec(cmds, {shell:'/bin/bash'}, (err, stdout, stderr) => {
-    if (err) return respond(res, 500, {ok:false, error:'deploy failed', details: stderr.toString()});
-    respond(res, 200, {ok:true, result: stdout.toString()});
-  });
-});
-const cfg = loadCfg();
-server.listen(cfg.listenPort, cfg.listenHost, () => console.log(`deploy-webhooks listening on ${cfg.listenHost}:${cfg.listenPort}`));
-JS
-
-  chown -R "$APP_USER:$APP_USER" "$WEBHOOK_DIR"
-  sudo -u "$APP_USER" bash -lc "
-    export NVM_DIR=\$HOME/.nvm; . \"\$NVM_DIR/nvm.sh\"
-    cd '$WEBHOOK_DIR'
-    npm init -y >/dev/null 2>&1 || true
-    pm2 start server.js --name deploy-webhooks
-    pm2 save
-    pm2 startup systemd -u '${APP_USER}' --hp '${APP_HOME}' | sed -n \"s/^.*\\(sudo.*pm2.*\\)\$/\\1/p\" | bash
-  "
-else
-  echo "Shared webhook server already present. Restarting to be safe."
-  sudo -u "$APP_USER" bash -lc "export NVM_DIR=\$HOME/.nvm; . \"\$NVM_DIR/nvm.sh\"; pm2 restart deploy-webhooks || true; pm2 save"
-fi
+# --- Shared webhook server (create once, via helper script) ---
+bash "${SCRIPT_DIR}/setup_webhook_server.sh"
 
 echo "Server setup complete. You can now run 02_add_app.sh to add apps."

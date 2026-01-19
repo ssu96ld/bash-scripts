@@ -20,6 +20,7 @@ GIT_USER="gitdeploy"
 APP_USER="${SUDO_USER:-$(id -un)}"
 APP_HOME="$(eval echo ~${APP_USER})"
 GIT_HOME="/home/${GIT_USER}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---- preflight ----
 if [[ $EUID -ne 0 ]]; then
@@ -216,148 +217,7 @@ issue_tls "${LIVE_DOMAIN}"
 [[ -n "${STAGING_DOMAIN}" ]] && issue_tls "${STAGING_DOMAIN}"
 
 # ---- Webhook integration ----
-install_or_upgrade_webhook_server() {
-  mkdir -p "${WEBHOOK_DIR}"
-
-  # Create hooks.json if missing
-  if [[ ! -f "${WEBHOOK_DIR}/hooks.json" ]]; then
-    cat > "${WEBHOOK_DIR}/hooks.json" <<JSON
-{
-  "listenHost": "127.0.0.1",
-  "listenPort": ${WEBHOOK_PORT},
-  "hooks": [],
-  "github": []
-}
-JSON
-    chown "${APP_USER}:${APP_USER}" "${WEBHOOK_DIR}/hooks.json"
-  fi
-
-  # Install/upgrade server.js to multi-app version if missing or outdated
-  local needs_upgrade="yes"
-  if [[ -f "${WEBHOOK_DIR}/server.js" ]]; then
-    if grep -q "MULTI_GITHUB_SUPPORT" "${WEBHOOK_DIR}/server.js"; then
-      needs_upgrade="no"
-    fi
-  fi
-
-  if [[ "${needs_upgrade}" == "yes" ]]; then
-    cp -a "${WEBHOOK_DIR}/server.js" "${WEBHOOK_DIR}/server.js.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-    cat > "${WEBHOOK_DIR}/server.js" <<'JS'
-// MULTI_GITHUB_SUPPORT
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const { exec } = require('child_process');
-
-const cfgPath = path.join(__dirname, 'hooks.json');
-
-function loadCfg() { return JSON.parse(fs.readFileSync(cfgPath, 'utf8')); }
-function respond(res, code, obj) { res.writeHead(code, {'Content-Type':'application/json'}); res.end(JSON.stringify(obj)); }
-
-function timingSafeEq(a, b) {
-  const A = Buffer.from(a || '');
-  const B = Buffer.from(b || '');
-  if (A.length !== B.length) return false;
-  return crypto.timingSafeEqual(A, B);
-}
-function verifyGitHubSig(buf, secret, hdr) {
-  if (!hdr || !hdr.startsWith('sha256=')) return false;
-  const h = crypto.createHmac('sha256', secret); h.update(buf);
-  const expected = 'sha256=' + h.digest('hex');
-  return timingSafeEq(expected, hdr);
-}
-function runDeploy(dir, branch, pm2Name, cb) {
-  const cmds = [
-    `cd '${dir.replace(/'/g, `'\\''`)}'`,
-    `git fetch --all --prune`,
-    `git reset --hard origin/${branch}`,
-    `(npm ci || npm install)`,
-    `pm2 restart '${pm2Name.replace(/'/g, `'\\''`)}'`
-  ].join(' && ');
-  exec(cmds, { shell:'/bin/bash' }, (err, stdout, stderr) => {
-    if (err) return cb(err, stderr.toString());
-    cb(null, stdout.toString());
-  });
-}
-
-const server = http.createServer((req, res) => {
-  const url = new URL(req.url, 'http://localhost');
-  const host = (req.headers['host'] || '').split(':')[0];
-  const cfg = loadCfg();
-
-  if (req.method === 'GET' && url.pathname === '/_deploy/health') {
-    return respond(res, 200, { ok:true, pong:true });
-  }
-
-  // simple hooks (per-domain, secret header)
-  const simpleCandidates = (cfg.hooks || []).filter(h => (h.path === url.pathname) && (h.type === 'simple' || !h.type));
-  if (simpleCandidates.length) {
-    if (req.method !== 'POST') return respond(res, 405, { ok:false, error:'method not allowed' });
-    let use = simpleCandidates.find(h => !!h.host && h.host === host) || simpleCandidates[0];
-    const secret = req.headers['x-webhook-secret'];
-    if (!secret || secret !== use.secret) return respond(res, 401, { ok:false, error:'unauthorized' });
-    return runDeploy(use.dir, use.branch, use.pm2, (err, out) => {
-      if (err) return respond(res, 500, { ok:false, error:'deploy failed', details: out });
-      return respond(res, 200, { ok:true, result: out, id: use.id, host });
-    });
-  }
-
-  // GitHub HMAC hooks (shared path; select by repo+ref)
-  const ghCandidates = (cfg.github || []).filter(h => h.path === url.pathname);
-  if (ghCandidates.length) {
-    if (req.method !== 'POST') return respond(res, 405, { ok:false, error:'method not allowed' });
-    const chunks = [];
-    req.on('data', d => chunks.push(d));
-    req.on('end', () => {
-      const buf = Buffer.concat(chunks);
-      const event = req.headers['x-github-event'] || '';
-      if (event === 'ping') return respond(res, 200, { ok:true, pong:true });
-
-      let lastErr = null;
-      for (const gh of ghCandidates) {
-        try {
-          const sig = req.headers['x-hub-signature-256'];
-          if (!verifyGitHubSig(buf, gh.secret, sig)) continue;
-          const payload = JSON.parse(buf.toString('utf8'));
-          const fullName = payload?.repository?.full_name;
-          const ref = payload?.ref;
-          if (gh.repo && fullName !== gh.repo) { lastErr = `repo mismatch ${fullName}`; continue; }
-          const target = gh.map?.[ref];
-          if (!target) { lastErr = `no mapping for ${ref}`; continue; }
-          return runDeploy(target.dir, target.branch, target.pm2, (err, out) => {
-            if (err) return respond(res, 500, { ok:false, error:'deploy failed', details: out, repo: fullName, ref });
-            return respond(res, 200, { ok:true, result: out, repo: fullName, ref, id: gh.id });
-          });
-        } catch (e) { lastErr = e.message; }
-      }
-      return respond(res, 200, { ok:true, ignored: lastErr || 'no candidate matched' });
-    });
-    return;
-  }
-
-  return respond(res, 404, { ok:false, error:'not found' });
-});
-
-const cfg = loadCfg();
-server.listen(cfg.listenPort, cfg.listenHost, () => {
-  console.log(`Webhook server listening on ${cfg.listenHost}:${cfg.listenPort}`);
-});
-JS
-    chown "${APP_USER}:${APP_USER}" "${WEBHOOK_DIR}/server.js"
-  fi
-
-  # Ensure pm2 process is up
-  sudo -u "${APP_USER}" bash -lc '
-    export NVM_DIR=$HOME/.nvm; . "$NVM_DIR/nvm.sh"
-    cd "'"${WEBHOOK_DIR}"'"
-    npm init -y >/dev/null 2>&1 || true
-    pm2 start server.js --name deploy-webhooks || pm2 restart deploy-webhooks
-    pm2 save
-  '
-}
-
-install_or_upgrade_webhook_server
+bash "${SCRIPT_DIR}/setup_webhook_server.sh"
 
 # ---- hooks.json entries for live/dev/staging + secrets ----
 python3 - "${WEBHOOK_DIR}/hooks.json" "${APP_NAME}" "${REPO_URL}" "${DEFAULT_BRANCH}" \
