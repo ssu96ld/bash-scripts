@@ -88,10 +88,9 @@ function runDeploy(dir, branch, pm2Name, cb) {
   const safeDir = dir.replace(/'/g, `'\\''`);
   const safePm2 = pm2Name.replace(/'/g, `'\\''`);
   const cmds = [
-    // Ensure git trusts this directory when run as gitdeploy (Git 2.35+ safe.directory)
-    `sudo -u ${GIT_USER} git config --global --add safe.directory '${safeDir}'`,
-    `sudo -u ${GIT_USER} git -C '${safeDir}' fetch --all --prune`,
-    `sudo -u ${GIT_USER} git -C '${safeDir}' reset --hard origin/${branch}`,
+    // Git 2.35+ safe.directory: trust this path for gitdeploy for these commands
+    `sudo -u ${GIT_USER} git -c safe.directory='${safeDir}' -C '${safeDir}' fetch --all --prune`,
+    `sudo -u ${GIT_USER} git -c safe.directory='${safeDir}' -C '${safeDir}' reset --hard origin/${branch}`,
     `cd '${safeDir}'`,
     `(npm ci || npm install)`,
     `pm2 restart '${safePm2}'`
