@@ -201,7 +201,7 @@ if [[ "$GITDEPLOY_EXISTS" == "true" ]]; then
   # List all deploy keys
   echo "    deploy_keys:"
   shopt -s nullglob
-  local deploy_keys=("${GIT_SSH_DIR}"/deploykey_*)
+  deploy_keys=("${GIT_SSH_DIR}"/deploykey_*)
   if [[ ${#deploy_keys[@]} -eq 0 ]]; then
     echo "      []"
   else
@@ -210,10 +210,9 @@ if [[ "$GITDEPLOY_EXISTS" == "true" ]]; then
       [[ "$key_file" == *.pub ]] && continue
       [[ -f "$key_file" ]] || continue
       
-      local key_name
       key_name="$(basename "$key_file")"
-      local app_name="${key_name#deploykey_}"
-      local pub_file="${key_file}.pub"
+      app_name="${key_name#deploykey_}"
+      pub_file="${key_file}.pub"
       
       echo "      - app: \"${app_name}\""
       echo "        private_key_path: \"${key_file}\""
