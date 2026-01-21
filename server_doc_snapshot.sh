@@ -7,8 +7,10 @@ set -euo pipefail
 WWW_ROOT="/var/www"
 NGINX_CONF_DIR="/etc/nginx/conf.d"
 GIT_USER="gitdeploy"
-PUBKEY_PATH="/home/${GIT_USER}/.ssh/id_ed25519.pub"
-PRIVKEY_PATH="/home/${GIT_USER}/.ssh/id_ed25519"
+GIT_SSH_DIR="/home/${GIT_USER}/.ssh"
+PUBKEY_PATH="${GIT_SSH_DIR}/id_ed25519.pub"
+PRIVKEY_PATH="${GIT_SSH_DIR}/id_ed25519"
+SSH_CONFIG_PATH="${GIT_SSH_DIR}/config"
 WEBHOOK_DIR="/opt/deploy-webhooks"
 HOOKS_JSON_PATH="${WEBHOOK_DIR}/hooks.json"
 
@@ -184,6 +186,47 @@ if [[ "$GITDEPLOY_EXISTS" == "true" ]]; then
   else
     echo "    private_key: \"(not found)\""
   fi
+  
+  # Show SSH config
+  echo "    config:"
+  if [[ -r "$SSH_CONFIG_PATH" ]]; then
+    echo "      path: \"${SSH_CONFIG_PATH}\""
+    echo "      content: |"
+    cat "$SSH_CONFIG_PATH" | indent 8
+  else
+    echo "      path: \"${SSH_CONFIG_PATH}\""
+    echo "      content: \"(not found)\""
+  fi
+  
+  # List all deploy keys
+  echo "    deploy_keys:"
+  shopt -s nullglob
+  local deploy_keys=("${GIT_SSH_DIR}"/deploykey_*)
+  if [[ ${#deploy_keys[@]} -eq 0 ]]; then
+    echo "      []"
+  else
+    for key_file in "${deploy_keys[@]}"; do
+      # Skip .pub files, we'll handle them with the private key
+      [[ "$key_file" == *.pub ]] && continue
+      [[ -f "$key_file" ]] || continue
+      
+      local key_name
+      key_name="$(basename "$key_file")"
+      local app_name="${key_name#deploykey_}"
+      local pub_file="${key_file}.pub"
+      
+      echo "      - app: \"${app_name}\""
+      echo "        private_key_path: \"${key_file}\""
+      if [[ -r "$pub_file" ]]; then
+        echo "        public_key_path: \"${pub_file}\""
+        echo "        public_key: |"
+        cat "$pub_file" | indent 10
+      else
+        echo "        public_key_path: \"(not found)\""
+        echo "        public_key: \"(not found)\""
+      fi
+    done
+  fi
 else
   echo "  note: \"user '${GIT_USER}' not found\""
 fi
@@ -259,6 +302,12 @@ if [[ -d "$WWW_ROOT" ]]; then
           done <<< "$WEBHOOK_MAP"
         fi
 
+        # Check for deploy key
+        deploy_key_priv="${GIT_SSH_DIR}/deploykey_${app_name}"
+        deploy_key_pub="${deploy_key_priv}.pub"
+        deploy_key_exists="false"
+        [[ -f "$deploy_key_priv" ]] && deploy_key_exists="true"
+
         echo "      - env: \"$(yaml_q "$env")\""
         echo "        path: \"$(yaml_q "$env_dir")\""
         echo "        repo: \"$(yaml_q "$repo")\""
@@ -267,6 +316,18 @@ if [[ -d "$WWW_ROOT" ]]; then
         echo "        commit_message: \"$(yaml_q "$subject")\""
         echo "        port: \"$(yaml_q "${port:-unknown}")\""
         echo "        domain: \"$(yaml_q "${domain:-unknown}")\""
+        echo "        ssh_deploy_key:"
+        if [[ "$deploy_key_exists" == "true" ]]; then
+          echo "          private_key: \"$(yaml_q "$deploy_key_priv")\""
+          echo "          public_key: \"$(yaml_q "$deploy_key_pub")\""
+          echo "          ssh_host_alias: \"${app_name}-github\""
+          if [[ -r "$deploy_key_pub" ]]; then
+            echo "          public_key_content: |"
+            cat "$deploy_key_pub" | indent 12
+          fi
+        else
+          echo "          note: \"no deploy key found for app '${app_name}'\""
+        fi
         echo "        pm2:"
         echo "          name: \"$(yaml_q "$pm2_name")\""
         echo "          status: \"$(yaml_q "${pm2_status:-unknown}")\""

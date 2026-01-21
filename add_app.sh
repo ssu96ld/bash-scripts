@@ -20,6 +20,8 @@ GIT_USER="gitdeploy"
 APP_USER="${SUDO_USER:-$(id -un)}"
 APP_HOME="$(eval echo ~${APP_USER})"
 GIT_HOME="/home/${GIT_USER}"
+SSH_DIR="${GIT_HOME}/.ssh"
+SSH_CONFIG="${SSH_DIR}/config"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---- preflight ----
@@ -61,21 +63,138 @@ DEV_DOMAIN="$(strip_domain "${DEV_DOMAIN}")"
 STAGING_DOMAIN="$(strip_domain "${STAGING_DOMAIN}")"
 LIVE_DOMAIN="$(strip_domain "${LIVE_DOMAIN}")"
 
+# ---- SSH Deploy Key Setup ----
+setup_deploy_key() {
+  local app_name="$1"
+  local repo_url="$2"
+  local key_path="${SSH_DIR}/deploykey_${app_name}"
+  local ssh_host_alias="${app_name}-github"
+  
+  # Create .ssh directory if it doesn't exist
+  mkdir -p "${SSH_DIR}"
+  chown "${GIT_USER}:${GIT_USER}" "${SSH_DIR}"
+  chmod 700 "${SSH_DIR}"
+  
+  # Generate SSH key if it doesn't exist
+  if [[ ! -f "${key_path}" ]]; then
+    echo "🔑 Generating SSH deploy key for ${app_name}..."
+    sudo -u "${GIT_USER}" ssh-keygen -t ed25519 -f "${key_path}" -N "" -C "deploykey-${app_name}"
+    chmod 600 "${key_path}"
+    chmod 644 "${key_path}.pub"
+  else
+    echo "✓ SSH deploy key for ${app_name} already exists"
+  fi
+  
+  # Extract github.com hostname from repo URL
+  local github_host="github.com"
+  if [[ "$repo_url" =~ github\.com ]]; then
+    github_host="github.com"
+  fi
+  
+  # Update SSH config to map the alias to github.com with this specific key
+  local config_block="# Deploy key for ${app_name}
+Host ${ssh_host_alias}
+  HostName ${github_host}
+  User git
+  IdentityFile ${key_path}
+  IdentitiesOnly yes
+"
+  
+  # Create or update SSH config
+  touch "${SSH_CONFIG}"
+  chown "${GIT_USER}:${GIT_USER}" "${SSH_CONFIG}"
+  chmod 600 "${SSH_CONFIG}"
+  
+  # Remove old config block for this app if it exists
+  if grep -q "# Deploy key for ${app_name}" "${SSH_CONFIG}"; then
+    # Remove the old block (from the comment line to the blank line after)
+    sudo -u "${GIT_USER}" sed -i.bak "/# Deploy key for ${app_name}/,/^$/d" "${SSH_CONFIG}"
+  fi
+  
+  # Append new config block
+  echo "${config_block}" | sudo -u "${GIT_USER}" tee -a "${SSH_CONFIG}" >/dev/null
+  
+  # Return the SSH host alias and key path for use in git URLs
+  echo "${ssh_host_alias}|${key_path}"
+}
+
+# Convert a GitHub URL to use SSH with custom host alias
+convert_repo_url_to_ssh() {
+  local url="$1"
+  local ssh_host_alias="$2"
+  
+  # Extract owner/repo from various URL formats
+  local owner_repo=""
+  if [[ "$url" =~ git@github\.com:([^/]+/[^/]+)(\.git)?$ ]]; then
+    owner_repo="${BASH_REMATCH[1]}"
+  elif [[ "$url" =~ https?://github\.com/([^/]+/[^/]+)(\.git)?$ ]]; then
+    owner_repo="${BASH_REMATCH[1]}"
+  else
+    # If not a GitHub URL, return as-is
+    echo "$url"
+    return
+  fi
+  
+  # Remove .git suffix if present
+  owner_repo="${owner_repo%.git}"
+  
+  # Return SSH URL with custom host alias
+  echo "git@${ssh_host_alias}:${owner_repo}.git"
+}
+
 # ---- Git helpers (run as gitdeploy) ----
 git_as_deploy() { sudo -u "${GIT_USER}" bash -lc "$*"; }
 
+# ---- Setup SSH Deploy Key ----
+echo "🔑 Setting up SSH deploy key..."
+SSH_SETUP_RESULT="$(setup_deploy_key "${APP_NAME}" "${REPO_URL}")"
+SSH_HOST_ALIAS="${SSH_SETUP_RESULT%|*}"
+DEPLOY_KEY_PATH="${SSH_SETUP_RESULT#*|}"
+DEPLOY_KEY_PUB="${DEPLOY_KEY_PATH}.pub"
+
+# Convert repo URL to use SSH with the custom host alias
+REPO_URL_SSH="$(convert_repo_url_to_ssh "${REPO_URL}" "${SSH_HOST_ALIAS}")"
+
+echo ""
+echo "================================================================"
+echo "📋 DEPLOY KEY - ACTION REQUIRED"
+echo "================================================================"
+echo ""
+echo "Please add the following public key as a deploy key to your GitHub repository:"
+echo "Repository: ${REPO_URL}"
+echo ""
+echo "Steps:"
+echo "  1. Go to: https://github.com/<owner>/<repo>/settings/keys/new"
+echo "  2. Add a title (e.g., 'Deploy key for ${APP_NAME}')"
+echo "  3. Paste the following public key:"
+echo ""
+echo "─────────────────────────────────────────────────────────────────"
+[[ -f "${DEPLOY_KEY_PUB}" ]] && cat "${DEPLOY_KEY_PUB}"
+echo "─────────────────────────────────────────────────────────────────"
+echo ""
+echo "  4. Check 'Allow write access' if you need to push branches from this server"
+echo "  5. Click 'Add key'"
+echo ""
+echo "Public key file location: ${DEPLOY_KEY_PUB}"
+echo ""
+echo "================================================================"
+read -rp "Press ENTER once you've added the deploy key to GitHub... " _
+echo ""
+echo "✓ Continuing with repository access..."
+echo ""
+
 branch_exists_remote() {
-  git_as_deploy "git ls-remote --heads '${REPO_URL}' '${1}'" | grep -q "refs/heads/${1}"
+  git_as_deploy "git ls-remote --heads '${REPO_URL_SSH}' '${1}'" | grep -q "refs/heads/${1}"
 }
 
 # Detect default branch
 DEFAULT_BRANCH="$(
-  git_as_deploy "git ls-remote --symref '${REPO_URL}' HEAD 2>/dev/null" \
+  git_as_deploy "git ls-remote --symref '${REPO_URL_SSH}' HEAD 2>/dev/null" \
   | sed -nE 's#^ref: refs/heads/([[:graph:]]+)[[:space:]]+HEAD$#\1#p' \
   | head -n1
 )"
 if [[ -z "${DEFAULT_BRANCH}" ]]; then
-  DEFAULT_BRANCH="$(git_as_deploy "git ls-remote '${REPO_URL}' 2>/dev/null" | awk -F/ '/refs\/heads\/(main|master)$/ {print $NF; exit}')"
+  DEFAULT_BRANCH="$(git_as_deploy "git ls-remote '${REPO_URL_SSH}' 2>/dev/null" | awk -F/ '/refs\/heads\/(main|master)$/ {print $NF; exit}')"
 fi
 : "${DEFAULT_BRANCH:=main}"
 
@@ -96,7 +215,7 @@ ensure_branch_exists_remote() {
   chown "${GIT_USER}:${GIT_USER}" "${TMP}"
   git_as_deploy "
     cd '${TMP}';
-    git clone '${REPO_URL}' repo;
+    git clone '${REPO_URL_SSH}' repo;
     cd repo;
     git checkout '${DEFAULT_BRANCH}' &&
     git checkout -b '${branch}' &&
@@ -114,9 +233,10 @@ clone_or_pull() {
   mkdir -p "${target_dir}"
   chown -R "${GIT_USER}:${APP_USER}" "${target_dir}"
   if [[ -d "${target_dir}/.git" ]]; then
-    git_as_deploy "cd '${target_dir}' && git fetch origin '${branch}' && git checkout '${branch}' && git pull origin '${branch}'"
+    # Update remote URL to use the SSH host alias
+    git_as_deploy "cd '${target_dir}' && git remote set-url origin '${REPO_URL_SSH}' && git fetch origin '${branch}' && git checkout '${branch}' && git pull origin '${branch}'"
   else
-    git_as_deploy "git clone --branch '${branch}' --single-branch '${REPO_URL}' '${target_dir}'"
+    git_as_deploy "git clone --branch '${branch}' --single-branch '${REPO_URL_SSH}' '${target_dir}'"
   fi
   chown -R "${APP_USER}:${APP_USER}" "${target_dir}"
 }
@@ -376,6 +496,15 @@ echo "Repo: ${REPO_URL} (branch: ${DEFAULT_BRANCH})"
 echo "Live:    https://${LIVE_DOMAIN} (PORT ${LIVE_PORT})"
 [[ -n "${DEV_DOMAIN}" ]] && echo "Dev:     https://${DEV_DOMAIN} (PORT ${DEV_PORT})"
 [[ -n "${STAGING_DOMAIN}" ]] && echo "Staging: https://${STAGING_DOMAIN} (PORT ${STAGING_PORT})"
+echo
+echo "🔑 SSH Deploy Key (add to GitHub repository as deploy key):"
+echo "   Public key file: ${DEPLOY_KEY_PUB}"
+if [[ -f "${DEPLOY_KEY_PUB}" ]]; then
+  echo "   Content:"
+  cat "${DEPLOY_KEY_PUB}" | sed 's/^/     /'
+fi
+echo "   Private key file: ${DEPLOY_KEY_PATH}"
+echo "   SSH config alias: ${SSH_HOST_ALIAS}"
 echo
 echo "Manual deploy webhooks (POST with X-Webhook-Secret):"
 echo "  https://${LIVE_DOMAIN}/_deploy/live        Secret: ${LIVE_HOOK_SECRET:-existing}"
