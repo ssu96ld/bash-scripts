@@ -77,12 +77,12 @@ setup_deploy_key() {
   
   # Generate SSH key if it doesn't exist
   if [[ ! -f "${key_path}" ]]; then
-    echo "🔑 Generating SSH deploy key for ${app_name}..."
-    sudo -u "${GIT_USER}" ssh-keygen -t ed25519 -f "${key_path}" -N "" -C "deploykey-${app_name}"
+    echo "🔑 Generating SSH deploy key for ${app_name}..." >&2
+    sudo -u "${GIT_USER}" ssh-keygen -t ed25519 -f "${key_path}" -N "" -C "deploykey-${app_name}" -q
     chmod 600 "${key_path}"
     chmod 644 "${key_path}.pub"
   else
-    echo "✓ SSH deploy key for ${app_name} already exists"
+    echo "✓ SSH deploy key for ${app_name} already exists" >&2
   fi
   
   # Extract github.com hostname from repo URL
@@ -169,7 +169,13 @@ echo "  2. Add a title (e.g., 'Deploy key for ${APP_NAME}')"
 echo "  3. Paste the following public key:"
 echo ""
 echo "─────────────────────────────────────────────────────────────────"
-[[ -f "${DEPLOY_KEY_PUB}" ]] && cat "${DEPLOY_KEY_PUB}"
+if [[ -f "${DEPLOY_KEY_PUB}" ]]; then
+  cat "${DEPLOY_KEY_PUB}"
+else
+  echo "ERROR: Public key file not found at ${DEPLOY_KEY_PUB}"
+  echo "Debug info: SSH_SETUP_RESULT=${SSH_SETUP_RESULT}"
+  exit 1
+fi
 echo "─────────────────────────────────────────────────────────────────"
 echo ""
 echo "  4. Check 'Allow write access' if you need to push branches from this server"
