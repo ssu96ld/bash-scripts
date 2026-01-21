@@ -245,13 +245,13 @@ clone_or_pull() {
     git_as_deploy "git clone --branch '${branch}' --single-branch '${REPO_URL_SSH}' '${target_dir}'"
   fi
   
-  # Set ownership: gitdeploy owns .git, APP_USER owns application files
-  # Both can access via group permissions
+  # Keep gitdeploy as owner so it can manage git operations (fetch, reset, etc.)
+  # APP_USER is in the group and can read/write via group permissions
   chown -R "${GIT_USER}:${APP_USER}" "${target_dir}"
-  chmod -R g+w "${target_dir}"
+  chmod -R g+rwX "${target_dir}"
   
-  # Make APP_USER owner of non-git files so they can run npm/pm2
-  find "${target_dir}" -mindepth 1 -maxdepth 1 ! -name .git -exec chown -R "${APP_USER}:${APP_USER}" {} \;
+  # Set setgid bit on directories so new files inherit the group
+  find "${target_dir}" -type d -exec chmod g+s {} \;
 }
 
 clone_or_pull "${DEFAULT_BRANCH}" "${LIVE_DIR}"

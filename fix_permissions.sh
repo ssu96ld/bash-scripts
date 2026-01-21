@@ -19,6 +19,13 @@ if ! id -u "$GIT_USER" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Ensure gitdeploy user is in APP_USER's primary group for shared access
+APP_USER_GID=$(id -g "$APP_USER")
+if ! id -nG "$GIT_USER" | grep -qw "$(id -gn "$APP_USER")"; then
+  echo "Adding ${GIT_USER} to ${APP_USER}'s group for shared file access..."
+  usermod -a -G "$(id -gn "$APP_USER")" "$GIT_USER"
+fi
+
 echo "Fixing permissions for app deployments in ${WWW_ROOT}..."
 echo "Git operations user: ${GIT_USER}"
 echo "Application user: ${APP_USER}"
@@ -53,19 +60,25 @@ for app_dir in "${APP_DIRS[@]}"; do
     # Set ownership: gitdeploy owns everything, APP_USER is the group
     chown -R "${GIT_USER}:${APP_USER}" "${env_dir}"
     
-    # Make group writable
-    chmod -R g+w "${env_dir}"
+    # Make group read/write/execute (X = execute only on dirs and executables)
+    chmod -R g+rwX "${env_dir}"
     
-    # Make APP_USER owner of non-git files so they can run npm/pm2
-    find "${env_dir}" -mindepth 1 -maxdepth 1 ! -name .git -exec chown -R "${APP_USER}:${APP_USER}" {} \;
+    # Set setgid bit on directories so new files inherit the group
+    find "${env_dir}" -type d -exec chmod g+s {} \;
     
-    echo "    ✓ Fixed permissions"
+    echo "    ✓ Fixed permissions (gitdeploy:${APP_USER} with group write)"
   done
 done
 
 echo ""
 echo "✓ Permissions fixed for all app deployments"
 echo ""
-echo "gitdeploy can now run git operations (fetch, reset, etc.)"
-echo "${APP_USER} can run npm and pm2 operations"
+echo "All files are owned by: ${GIT_USER}:${APP_USER}"
+echo "Group permissions: read+write+execute"
+echo "Setgid on directories: enabled (new files inherit group)"
+echo ""
+echo "This allows:"
+echo "  - ${GIT_USER} can run git operations (fetch, reset, checkout, etc.)"
+echo "  - ${APP_USER} can run npm and pm2 operations"
+echo "  - Both users can read/write files via group permissions"
 
