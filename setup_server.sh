@@ -63,4 +63,11 @@ sudo -u "$APP_USER" bash -lc "
 # --- Shared webhook server (create once, via helper script) ---
 bash "${SCRIPT_DIR}/setup_webhook_server.sh"
 
-echo "Server setup complete. You can now run 02_add_app.sh to add apps."
+echo ""
+echo "=========================================="
+echo "Server setup complete!"
+echo "=========================================="
+echo ""
+echo "IMPORTANT: You must LOG OUT and LOG BACK IN for nvm/node/npm to be available."
+echo "After logging back in, you can run add_app.sh to add apps."
+echo ""
