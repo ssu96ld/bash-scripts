@@ -278,10 +278,10 @@ NEXT=$((DEV_PORT+1)); STAGING_PORT="$(find_free_port "${NEXT}")"
 # ---- PM2 ecosystem ----
 make_ecosystem(){
   local dir="$1" name="$2" port="$3" env="$4"
-  cat > "${dir}/ecosystem.config.js" <<EOF
+  cat > "${dir}/ecosystem.config.cjs" <<EOF
 module.exports = { apps: [{ name: "${name}", cwd: "${dir}", script: "npm", args: "start", env: { PORT: "${port}", NODE_ENV: "${env}" }, watch: false }] };
 EOF
-  chown "${APP_USER}:${APP_USER}" "${dir}/ecosystem.config.js"
+  chown "${APP_USER}:${APP_USER}" "${dir}/ecosystem.config.cjs"
 }
 make_env(){
   local dir="$1" port="$2" env="$3"
@@ -302,7 +302,7 @@ start_pm2(){
     npm config set fund false >/dev/null 2>&1 || true
     npm config set audit false >/dev/null 2>&1 || true
     CI=1 npm ci --no-audit --no-fund --unsafe-perm || CI=1 npm install --no-audit --no-fund --unsafe-perm
-    pm2 start ecosystem.config.js || pm2 restart ecosystem.config.js
+    pm2 start ecosystem.config.cjs || pm2 restart ecosystem.config.cjs
   '
 }
 
