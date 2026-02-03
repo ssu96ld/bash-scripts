@@ -85,6 +85,108 @@ build_certbot_domain_args() {
   printf '%s\0' "${args[@]}"
 }
 
+get_cert_paths_for_domain_pair() {
+  # For wildcard mode, we want a cert covering BOTH:
+  # - ${DOMAIN}
+  # - *.${DOMAIN}
+  # Output: "fullchain_path\nprivkey_path\n"
+  local apex="$1" wild="$2"
+  python3 - "${apex}" "${wild}" <<'PY'
+import re, subprocess, sys
+
+apex, wild = sys.argv[1], sys.argv[2]
+out = subprocess.check_output(["certbot", "certificates"], text=True, stderr=subprocess.STDOUT)
+
+# Split into cert blocks by "Certificate Name:"
+blocks = re.split(r"\n(?=Certificate Name: )", "\n" + out)
+for b in blocks:
+    if "Certificate Name:" not in b:
+        continue
+    m_domains = re.search(r"^\s*Domains:\s*(.+)$", b, flags=re.M)
+    if not m_domains:
+        continue
+    domains = set(m_domains.group(1).split())
+    if apex not in domains or wild not in domains:
+        continue
+    m_full = re.search(r"^\s*Certificate Path:\s*(.+)$", b, flags=re.M)
+    m_key = re.search(r"^\s*Private Key Path:\s*(.+)$", b, flags=re.M)
+    if not (m_full and m_key):
+        continue
+    print(m_full.group(1).strip())
+    print(m_key.group(1).strip())
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+ensure_ssl_server_block() {
+  local conf_path="$1"
+  local server_names="$2"
+  local port="$3"
+  local fullchain="$4"
+  local privkey="$5"
+
+  local ssl_include="" ssl_dhparam=""
+  if [[ -f "/etc/letsencrypt/options-ssl-nginx.conf" ]]; then
+    ssl_include="  include /etc/letsencrypt/options-ssl-nginx.conf;"
+  fi
+  if [[ -f "/etc/letsencrypt/ssl-dhparams.pem" ]]; then
+    ssl_dhparam="  ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;"
+  fi
+
+  python3 - "${conf_path}" "${server_names}" "${port}" "${fullchain}" "${privkey}" "${ssl_include}" "${ssl_dhparam}" "${WEBHOOK_PORT}" <<'PY'
+import os, sys
+
+path, names, port, fullchain, privkey, ssl_include, ssl_dhparam, webhook_port = sys.argv[1:9]
+
+with open(path, "r", encoding="utf-8") as f:
+    text = f.read()
+
+if "listen 443" in text and "ssl_certificate" in text:
+    # Already has an SSL section; don't try to be clever here.
+    raise SystemExit(0)
+
+ssl_lines = [
+    "",
+    "server {",
+    "  listen 443 ssl http2; listen [::]:443 ssl http2;",
+    f"  server_name {names};",
+    "",
+    f"  ssl_certificate {fullchain};",
+    f"  ssl_certificate_key {privkey};",
+]
+if ssl_include:
+    ssl_lines.append(ssl_include)
+if ssl_dhparam:
+    ssl_lines.append(ssl_dhparam)
+
+ssl_lines += [
+    "",
+    "  location / {",
+    f"    proxy_pass http://127.0.0.1:{port};",
+    "    proxy_http_version 1.1;",
+    "    proxy_set_header Upgrade $http_upgrade;",
+    '    proxy_set_header Connection "upgrade";',
+    "    proxy_set_header Host $host;",
+    "    proxy_set_header X-Real-IP $remote_addr;",
+    "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+    "    proxy_set_header X-Forwarded-Proto $scheme;",
+    "  }",
+    "",
+    f"  location ^~ /_deploy/ {{ proxy_pass http://127.0.0.1:{webhook_port}; }}",
+    f"  location ^~ /_github/ {{ proxy_pass http://127.0.0.1:{webhook_port}; }}",
+    "}",
+    "",
+]
+
+text = text.rstrip() + "\n" + "\n".join(ssl_lines)
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write(text)
+os.replace(tmp, path)
+PY
+}
+
 read_hook() {
   local app="$1" branch="$2"
   python3 - "${HOOKS_JSON}" "${app}" "${branch}" <<'PY'
@@ -214,6 +316,9 @@ for d in "${DOMAINS[@]}"; do
   fi
   SERVER_NAME_DOMAINS+=("${d}")
 done
+if [[ "${WILDCARD_MODE}" == "true" ]]; then
+  SERVER_NAME_DOMAINS+=("*.${DOMAIN}")
+fi
 mapfile -t SERVER_NAME_DOMAINS < <(dedupe_domains "${SERVER_NAME_DOMAINS[@]:-}")
 SERVER_NAMES="$(join_by_space "${SERVER_NAME_DOMAINS[@]:-}")"
 SERVER_NAMES="$(printf '%s' "${SERVER_NAMES}" | tr -s ' ' | sed 's/^ //; s/ $//')"
@@ -264,6 +369,23 @@ if [[ "${WILDCARD_MODE}" == "true" ]]; then
   certbot certonly --manual --preferred-challenges dns --manual-public-ip-logging-ok \
     --agree-tos --register-unsafely-without-email \
     "${CERTBOT_ARGS[@]}"
+
+  # certonly does NOT edit nginx config, so add an SSL server block ourselves.
+  FULLCHAIN=""
+  PRIVKEY=""
+  CERT_PATHS="$(get_cert_paths_for_domain_pair "${DOMAIN}" "*.${DOMAIN}")" || {
+    echo "WARNING: could not locate certbot certificate paths for ${DOMAIN} and *.${DOMAIN}" >&2
+    CERT_PATHS=""
+  }
+  if [[ -n "${CERT_PATHS}" ]]; then
+    FULLCHAIN="$(printf '%s\n' "${CERT_PATHS}" | sed -n '1p')"
+    PRIVKEY="$(printf '%s\n' "${CERT_PATHS}" | sed -n '2p')"
+  fi
+  if [[ -n "${FULLCHAIN}" && -n "${PRIVKEY}" ]]; then
+    ensure_ssl_server_block "${CONF_PATH}" "${SERVER_NAMES}" "${PORT}" "${FULLCHAIN}" "${PRIVKEY}"
+  else
+    echo "WARNING: skipping nginx SSL block update (missing cert paths)" >&2
+  fi
 else
   certbot --nginx --non-interactive --agree-tos --register-unsafely-without-email \
     "${CERTBOT_ARGS[@]}"
