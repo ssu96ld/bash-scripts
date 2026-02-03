@@ -75,6 +75,16 @@ dedupe_domains() {
   printf '%s\n' "${out[@]:-}"
 }
 
+build_certbot_domain_args() {
+  # outputs: "-d domain1 -d domain2 ..."
+  local -a args=() d
+  for d in "$@"; do
+    [[ -z "${d}" ]] && continue
+    args+=("-d" "${d}")
+  done
+  printf '%s\0' "${args[@]}"
+}
+
 read_hook() {
   local app="$1" branch="$2"
   python3 - "${HOOKS_JSON}" "${app}" "${branch}" <<'PY'
@@ -196,7 +206,16 @@ server {
 EOF
 }
 
-SERVER_NAMES="$(join_by_space "${DOMAIN}" $(printf '%s\n' "${DOMAINS[@]}" | grep -v '^\*\.' || true))"
+SERVER_NAME_DOMAINS=()
+for d in "${DOMAINS[@]}"; do
+  # Exclude wildcard names from nginx server_name
+  if [[ "${d}" == \*.* ]]; then
+    continue
+  fi
+  SERVER_NAME_DOMAINS+=("${d}")
+done
+mapfile -t SERVER_NAME_DOMAINS < <(dedupe_domains "${SERVER_NAME_DOMAINS[@]:-}")
+SERVER_NAMES="$(join_by_space "${SERVER_NAME_DOMAINS[@]:-}")"
 SERVER_NAMES="$(printf '%s' "${SERVER_NAMES}" | tr -s ' ' | sed 's/^ //; s/ $//')"
 [[ -z "${SERVER_NAMES}" ]] && SERVER_NAMES="${DOMAIN}"
 
@@ -211,7 +230,25 @@ else
 
   # Ensure the vhost includes all requested non-wildcard names.
   if grep -qE '^[[:space:]]*server_name[[:space:]]+' "${CONF_PATH}"; then
-    sed -i.bak -E "s#^[[:space:]]*server_name[[:space:]].*;[[:space:]]*$#  server_name ${SERVER_NAMES};#g" "${CONF_PATH}"
+    python3 - "${CONF_PATH}" "${SERVER_NAMES}" <<'PY'
+import io, sys
+path, names = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+out = []
+for line in lines:
+    stripped = line.lstrip()
+    if stripped.startswith("server_name "):
+        indent = line[: len(line) - len(stripped)]
+        out.append(f"{indent}server_name {names};\n")
+    else:
+        out.append(line)
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.writelines(out)
+import os
+os.replace(tmp, path)
+PY
   fi
 fi
 
@@ -220,14 +257,16 @@ systemctl reload nginx
 
 echo
 echo "Requesting/renewing TLS cert for: ${DOMAINS[*]} (branch=${BRANCH}, app=${APP_NAME})"
+CERTBOT_ARGS=()
+while IFS= read -r -d '' part; do CERTBOT_ARGS+=("$part"); done < <(build_certbot_domain_args "${DOMAINS[@]}")
 if [[ "${WILDCARD_MODE}" == "true" ]]; then
   echo "Wildcard certs require a DNS challenge. Certbot will prompt you to create TXT records."
   certbot certonly --manual --preferred-challenges dns --manual-public-ip-logging-ok \
     --agree-tos --register-unsafely-without-email \
-    $(printf -- " -d %q" "${DOMAINS[@]}")
+    "${CERTBOT_ARGS[@]}"
 else
   certbot --nginx --non-interactive --agree-tos --register-unsafely-without-email \
-    $(printf -- " -d %q" "${DOMAINS[@]}")
+    "${CERTBOT_ARGS[@]}"
 fi
 
 nginx -t
