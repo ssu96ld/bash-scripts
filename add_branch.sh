@@ -219,6 +219,7 @@ server {
     proxy_pass http://127.0.0.1:${WEBHOOK_PORT};
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
+    proxy_read_timeout 300s;
   }
 
   # GitHub Webhooks (HMAC)
@@ -226,6 +227,7 @@ server {
     proxy_pass http://127.0.0.1:${WEBHOOK_PORT};
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
+    proxy_read_timeout 300s;
   }
 }
 EOF
